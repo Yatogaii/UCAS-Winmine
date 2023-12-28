@@ -1,0 +1,151 @@
+:PROPERTIES:
+:ID:       3af7fc6b-d412-4cfc-95c4-6a93bc0ecda2
+:END:
+#+title: winmine hackup
+#+filetags: :draft:
+
+* WinMine
+
+** 分析
+
+*** 关键地址定位
+有三个关键地址需要找到：雷区宽度、雷区高度、雷区起始位置。
+
+对于雷区高度和雷区宽度，可以通过 CheatEngine 反复搜索来找到，如下图所示。
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231228_171404.png]]
+#+END_IMAGE
+
+之后就是找雷区起始位置了，找到雷区起始位置是最重要也是最难的部分。
+
+由于我们已经找到了雷区长宽的大小，那么可以确定初始化雷区是一定需要用到这两个变量的，因此直接使用 x32dbg 提供的 find reference 功能，如下图所示。
+
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_111609.png]]
+#+END_IMAGE
+
+可以看出其余大部分指令都是把 1005338 当作源操作数，010036AC 这里把 01005338 当作了目的操作数，与众不同，可以着重分析一下。
+
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_111638.png]]
+#+END_IMAGE
+
+进入内部发现在操作宽和高对应的内存区域后，扫雷程序紧接着调用了 1002ED5 处的函数，进入这个函数，如下图：
+
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_114606.png]]
+#+END_IMAGE
+
+发现这个函数里是一个二位数组的操作，分析这块地址的内存，再结合游戏时的地雷、内存变化，可以确定地雷内存地址是从 1005361 开始的，其中：
+1. 40 代表空格子
+2. 41 代表写了1的格子
+3. 8A 代表雷
+4. 0F 代表还没打开的格子
+
+*** 扫雷不死实现
+扫雷不死实现需要先定位到踩到雷之后的处理函数，打开游戏里的声音，踩到雷之后就会触发 ~PlaySoundw~ 函数，之后在 References 里面把三个 ~PlaySoundw~ 的函数全打上断点。
+
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_115917.png]]
+#+END_IMAGE
+
+之后发现是这里的这几条指令在一直触发断点，即便在没有操作的情况下也很频繁触发，但是去除这个断点后游戏失败时播放声音又不会触发其余两个的断点，因此可以确定这个函数就是游戏结束时对应的播放声音的函数。
+
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_115807.png]]
+#+END_IMAGE
+
+之后查找所有调用这一段函数（跳转到010038ED）的代码地址，如下：
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_153212.png]]
+#+END_IMAGE
+
+基本可以确定游戏失败时的处理函数就在这三个之间，全部打上断点，之后继续调试，主动失败一次，程序跳转到了这里：
+
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_153731.png]]
+#+END_IMAGE
+
+之后在 0100347C 这里手动打上断点，重头开始调试，发现程序断在这里的时候，地雷已经显示在游戏上了，但是这时候还没进入失败界面，可以确定游戏不死的关键就在这一部分代码内：
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_154028.png]]
+#+END_IMAGE
+
+单步执行完毕 0100347C 处的函数后，发现没有能下手的地方，因此可以假定 0100347C 为游戏结束函数，通过 x32dbg 的找到所有引用功能，在三个调用该函数的部分都打上断点。
+
+之后再次踩雷，发现程序触发了010035AB 的断点，并且是 push 0 过来的，手动修改堆栈 0 变成 1，继续执行程序，发现出现了胜利结算动画。
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_165944.png]]
+#+END_IMAGE
+
+这样就可以确定 0100347C 处的函数定义为 ~game_end(bool win)~ ，通过每次失败时，修改堆栈顶部的 0 到 1 ，就能实现踩雷也通关的效果。
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231227_165959.png]]
+#+END_IMAGE
+
+
+
+** 实现
+
+*** 一键通关
+**** 主要思路
+遍历雷区内存，只要不是雷就模拟鼠标点击一次。
+
+**** 代码实现
+通过 kernel32 来读取指定程序的内存，通过 win32api 的 PostMessage 来模拟鼠标点击操作。
+#+begin_src python
+    game_width = c_int(0)
+    kernel32.ReadProcessMemory(int(phand), GAME_WIDTH_ADDR, byref(game_width), 2, None)
+    game_height = c_int(0)
+    kernel32.ReadProcessMemory(int(phand), GAME_HEIGHT_ADDR, byref(game_height), 2, None)
+
+    addr = create_string_buffer(MEM_WIDTH * game_height.value)
+    kernel32.ReadProcessMemory(int(phand), GAME_DATA_ADDR, byref(addr), MEM_WIDTH * game_height.value, None)
+
+    for i in range(game_height.value):
+        for j in range(game_width.value):
+            current = hex(addr.value[i * MEM_WIDTH + j])
+            # print(current, end=" ")
+            if current == "0xf":
+                win32api.PostMessage(window_handle, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, win32api.MAKELONG(19 + j * 16, 63 + i * 16))
+                win32api.PostMessage(window_handle, win32con.WM_LBUTTONUP, 0, 0)
+#+end_src
+
+**** 效果
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231228_211347.png]]
+#+END_IMAGE
+
+
+*** 不死
+**** 主要思路
+有上文的分析可知，游戏胜利 or 失败进入的是同一个函数，函数定义可以等价认为是 ~gameover(bool win)~ ，汇编代码在游戏胜利 or 失败的情况下，会分别在 call 指令前 ~push 1 or 0~ ，那么只要修改 ~push 0~ 到 ~push 1~ ，即可实现踩雷也通关的效果。
+
+**** 代码实现
+同样是利用 kernel32 ，把 push 1 对应的二进制代码 ~\x6A\x01~ 写到上文中找到的 push 0 地址上即可。
+
+#+begin_src python
+    old_protect = wintypes.DWORD()
+    if not kernel32.VirtualProtectEx(ctypes.c_void_p(h_process), ctypes.c_void_p(address), len(data),
+                                     PAGE_EXECUTE_READWRITE, ctypes.byref(old_protect)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    bytes_written = ctypes.c_size_t()
+    if not kernel32.WriteProcessMemory(h_process, ctypes.c_void_p(address), create_string_buffer(data),
+                                       len(data), ctypes.byref(bytes_written)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    if not kernel32.VirtualProtectEx(h_process, ctypes.c_void_p(address), len(data), old_protect,
+                                     ctypes.byref(old_protect)):
+        raise ctypes.WinError(ctypes.get_last_error())
+#+end_src
+
+**** 效果
+#+BEGIN_IMAGE
+[[file:winmine hackup/20231228_154409.png]]
+#+END_IMAGE
+
+
+* 参考文献
+- 一键通关：https://www.lzskyline.com/index.php/archives/128
+- 踩雷不死：https://www.youtube.com/watch?v=ixB7iaea4l0
